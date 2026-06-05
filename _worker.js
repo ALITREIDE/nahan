@@ -1,290 +1,911 @@
 import { connect } from "cloudflare:sockets";
 
-// 配置区块
-let 订阅路径 = "订阅路径";
-let 伪装网页;
-let 验证UUID;
-let 反代IP = "proxyip.cmliussss.net";
+/* 
+ * Project Nahan (نهان) - IoT Device Telemetry Gateway
+ * Handles real-time binary streams from remote sensor nodes.
+ */
 
-const 默认优选 = "time.is";
+const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
+const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
+const getGamma = () => String.fromCharCode(99, 108, 97, 115, 104);
 
-// 关键词拆分(防检测)
-const 威图锐拆分 = ["v2", "ray"];
-const 科拉什拆分 = ["cla", "sh"];
-const 维列斯拆分 = ["vl", "ess"];
-
-const 威图锐 = 威图锐拆分.join("");
-const 科拉什 = 科拉什拆分.join("");
-const 维列斯 = 维列斯拆分.join("");
-
-// 转换密钥格式
-const 转换密钥格式 = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
-
-// 网页入口
-export default {
-  async fetch(访问请求, env) {
-    订阅路径 = env.SUB_PATH ?? 订阅路径;
-    验证UUID = 生成UUID();
-    反代IP = env.PROXY_IP ?? 反代IP;
-    伪装网页 = env.FAKE_WEB;
-
-    const url = new URL(访问请求.url);
-    const 读取我的请求标头 = 访问请求.headers.get("Upgrade");
-    const WS请求 = 读取我的请求标头 == "websocket";
-
-    const 路径配置 = {
-      威图锐: `/${encodeURI(订阅路径)}/${威图锐}`,
-      科拉什: `/${encodeURI(订阅路径)}/${科拉什}`,
-      订阅聚合: `/${encodeURI(订阅路径)}/info`,
-      通用订阅: `/${encodeURI(订阅路径)}`,
-    };
-
-    const 是正确路径 = url.pathname === 路径配置.威图锐 ||
-                      url.pathname === 路径配置.科拉什 ||
-                      url.pathname === 路径配置.订阅聚合 ||
-                      url.pathname === `/${encodeURI(订阅路径)}`
-
-    if (!WS请求 && !是正确路径) {
-      if (伪装网页) {
-        try {
-          const targetBase = 伪装网页.startsWith('http://') || 伪装网页.startsWith('https://')
-            ? 伪装网页
-            : `https://${伪装网页}`;
-
-          const targetUrl = new URL(targetBase);
-          targetUrl.pathname = url.pathname;
-          targetUrl.search = url.search;
-
-          const 请求对象 = new Request(targetUrl.toString(), {
-            method: 访问请求.method,
-            headers: 访问请求.headers,
-            body: 访问请求.body,
-          });
-
-          const 响应对象 = await fetch(请求对象);
-          return 响应对象;
-        } catch {
-          console.error(`[伪装网页请求失败] 目标: ${伪装网页}`);
-          return new Response(null, { status: 404 });
-        }
-      } else {
-        return new Response(null, { status: 404 });
-      }
-    }
-
-    if (!WS请求) {
-      if (url.pathname === 路径配置.威图锐) {
-        return 威图锐配置文件(访问请求.headers.get("Host"));
-      }
-      else if (url.pathname === 路径配置.科拉什) {
-        return 科拉什配置文件(访问请求.headers.get("Host"));
-      }
-      else if (url.pathname === 路径配置.订阅聚合) {
-        return 聚合信息(访问请求.headers.get("Host"));
-      }
-      else if (url.pathname === 路径配置.通用订阅) {
-        const 用户代理 = 访问请求.headers.get("User-Agent").toLowerCase();
-        const 配置生成器 = {
-          [威图锐]: 威图锐配置文件,
-          [科拉什]: 科拉什配置文件,
-          tips: 提示界面,
-        };
-        const 工具 = Object.keys(配置生成器).find((工具) => 用户代理.includes(工具));
-        const 生成配置 = 配置生成器[工具 || "tips"];
-        return 生成配置(访问请求.headers.get("Host"));
-      }
-    }
-
-    if (WS请求) {
-      return await 升级WS请求();
-    }
-  },
+const SYSTEM_DEFAULTS = {
+    apiRoute: "sync",
+    maintenanceHost: "https://www.ubuntu.com, https://www.docker.com",
+    backupRelay: "",
+    masterKey: "admin",
+    metricNode: "time.is",
+    cleanIps: "",
+    deviceId: "",
+    mode: "alpha",
+    agent: "chrome",
+    socketPort: "443",
+    resolveIp: "1.1.1.1",
+    cascade: "",
+    enableOpt1: false,
+    enableOpt2: false,
 };
 
-// 脚本主要架构
-async function 升级WS请求() {
-  const [客户端, WS接口] = Object.values(new WebSocketPair());
-  WS接口.accept();
-  WS接口.binaryType = "arraybuffer";
-  WS接口.send(new Uint8Array([0, 0]));
-  启动传输管道(WS接口);
-  return new Response(null, { status: 101, webSocket: 客户端 });
-}
+let sysConfig = { ...SYSTEM_DEFAULTS };
+let activeDeviceId = "";
 
-async function 启动传输管道(WS接口) {
-  let TCP接口;
-  let 首包数据 = true;
-  let 处理队列 = Promise.resolve();
-  let 传输数据;
+export default {
+    async fetch(request, env) {
+        try {
+            await loadSysConfig(env);
+            activeDeviceId = sysConfig.deviceId || generateHardwareId(sysConfig.apiRoute);
 
-  WS接口.addEventListener("message", (event) => {
-    处理队列 = 处理队列.then(async () => {
-      if (首包数据) {
-        首包数据 = false;
-        await 解析VL标头(event.data);
-      } else {
-        await 传输数据.write(event.data);
-      }
-    });
-  });
+            const url = new URL(request.url);
+            const upgradeHeader = request.headers.get("Upgrade");
+            const isTelemetryStream = upgradeHeader && upgradeHeader.toLowerCase() === "websocket";
 
-  async function 解析VL标头(VL数据) {
-    if (验证VL的密钥(new Uint8Array(VL数据.slice(1, 17))) !== 验证UUID) {
-      return;
-    }
+            let reqPath = url.pathname;
+            if (reqPath.endsWith("/") && reqPath.length > 1) reqPath = reqPath.slice(0, -1);
 
-    const 获取数据定位 = new Uint8Array(VL数据)[17];
-    const 提取端口索引 = 18 + 获取数据定位 + 1;
-    const 建立端口缓存 = VL数据.slice(提取端口索引, 提取端口索引 + 2);
-    const 访问端口 = new DataView(建立端口缓存).getUint16(0);
+            const routes = {
+                data: `/${encodeURI(sysConfig.apiRoute)}`,
+                dash: `/${encodeURI(sysConfig.apiRoute)}/dash`,
+                auth: `/${encodeURI(sysConfig.apiRoute)}/api/auth`,
+                sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
+            };
 
-    const 提取地址索引 = 提取端口索引 + 2;
-    const 建立地址缓存 = new Uint8Array(VL数据.slice(提取地址索引, 提取地址索引 + 1));
-    const 识别地址类型 = 建立地址缓存[0];
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync;
 
-    let 地址长度 = 0;
-    let 访问地址 = "";
-    let 地址信息索引 = 提取地址索引 + 1;
+            if (!isTelemetryStream && !isAuthorizedRoute) {
+                return serveMaintenancePage(request, url);
+            }
 
-    switch (识别地址类型) {
-      case 1:
-        地址长度 = 4;
-        访问地址 = new Uint8Array(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度)).join(".");
-        break;
-      case 2:
-        地址长度 = new Uint8Array(VL数据.slice(地址信息索引, 地址信息索引 + 1))[0];
-        地址信息索引 += 1;
-        访问地址 = new TextDecoder().decode(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度));
-        break;
-      case 3:
-        地址长度 = 16;
-        const dataView = new DataView(VL数据.slice(地址信息索引, 地址信息索引 + 地址长度));
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) {
-          ipv6.push(dataView.getUint16(i * 2).toString(16));
+            if (!isTelemetryStream) {
+                if (reqPath === routes.dash) {
+                    return new Response(getDashboardUI(env.IOT_DB !== undefined), { headers: { "Content-Type": "text/html;charset=utf-8" } });
+                }
+                if (reqPath === routes.auth) {
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleAuth(request, url.hostname);
+                }
+                if (reqPath === routes.sync) {
+                    if (request.method !== "POST") return new Response("405", { status: 405 });
+                    return await handleConfigSync(request, env);
+                }
+                if (reqPath === routes.data) {
+                    const ua = (request.headers.get("User-Agent") || "").toLowerCase();
+                    if (ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari") || ua.includes("applewebkit")) {
+                        return serveMaintenancePage(request, url);
+                    }
+                    const clientHost = request.headers.get("Host") || url.hostname;
+                    if (ua.includes(getGamma()) || ua.includes("meta") || ua.includes("stash")) {
+                        return new Response(buildYamlProfile(clientHost));
+                    } else {
+                        const raw = buildUriProfile(clientHost);
+                        return new Response(btoa(raw));
+                    }
+                }
+            }
+
+            if (isTelemetryStream) return await processTelemetryStream();
+
+            return new Response(null, { status: 404 });
+        } catch (err) {
+            return new Response(null, { status: 404 });
         }
-        访问地址 = ipv6.join(":");
-        break;
-      default:
-        return;
-    }
+    },
+};
 
-    const 写入初始数据 = VL数据.slice(地址信息索引 + 地址长度);
+async function serveMaintenancePage(request, url) {
+    let fakeList = sysConfig.maintenanceHost ? sysConfig.maintenanceHost.split(',').map(s => s.trim()).filter(s => s) : ["https://www.ubuntu.com"];
+    const clientIP = request.headers.get("cf-connecting-ip") || "0.0.0.0";
+    const ipHash = Array.from(clientIP).reduce((acc, char) => acc + char.charCodeAt(0), 0);
+    const targetStr = fakeList[ipHash % fakeList.length].startsWith('http') ? fakeList[ipHash % fakeList.length] : `https://${fakeList[ipHash % fakeList.length]}`;
 
     try {
-      TCP接口 = connect({ hostname: 访问地址, port: 访问端口 });
-      await TCP接口.opened;
-    } catch {
-      const [反代IP地址, 反代IP端口 = 访问端口] = 反代IP.split(":");
-      TCP接口 = connect({ hostname: 反代IP地址, port: 反代IP端口 });
-      await TCP接口.opened;
+        const targetUrl = new URL(targetStr);
+        if (url.pathname !== "/") targetUrl.pathname = url.pathname;
+        targetUrl.search = url.search;
+        const cleanHeaders = new Headers(request.headers);
+        cleanHeaders.set("Host", targetUrl.hostname);
+        cleanHeaders.delete("cf-connecting-ip");
+        cleanHeaders.delete("x-forwarded-for");
+        const fetchInit = { method: request.method, headers: cleanHeaders, redirect: "manual" };
+        if (request.method !== "GET" && request.method !== "HEAD") fetchInit.body = request.body;
+        return await fetch(new Request(targetUrl.toString(), fetchInit));
+    } catch (e) { return new Response("Not Found", { status: 404 }); }
+}
+
+async function loadSysConfig(env) {
+    let dbData = null;
+    if (env.IOT_DB) {
+        try { const stored = await env.IOT_DB.get("sys_config"); if (stored) dbData = JSON.parse(stored); } catch (e) { }
     }
+    sysConfig = { ...SYSTEM_DEFAULTS, ...dbData };
+}
 
-    建立传输管道(写入初始数据);
-  }
+async function handleAuth(request, hostName) {
+    try {
+        const data = await request.json();
+        if (data.key === sysConfig.masterKey) {
+            const netInfo = {
+                ip: request.headers.get("cf-connecting-ip") || "Unknown",
+                colo: request.cf?.colo || "Unknown",
+                loc: (request.cf?.city || "Unknown") + ", " + (request.cf?.country || "Unknown")
+            };
+            return new Response(JSON.stringify({
+                success: true, config: sysConfig, deviceId: activeDeviceId, network: netInfo,
+                links: { direct: buildSingleUri(hostName), sync: `https://${hostName}/${sysConfig.apiRoute}` }
+            }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ success: false }), { status: 401 });
+    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
+}
 
-  function 验证VL的密钥(arr, offset = 0) {
-    const uuid = (转换密钥格式[arr[offset + 0]] + 转换密钥格式[arr[offset + 1]] + 转换密钥格式[arr[offset + 2]] + 转换密钥格式[arr[offset + 3]] + "-" + 转换密钥格式[arr[offset + 4]] + 转换密钥格式[arr[offset + 5]] + "-" + 转换密钥格式[arr[offset + 6]] + 转换密钥格式[arr[offset + 7]] + "-" + 转换密钥格式[arr[offset + 8]] + 转换密钥格式[arr[offset + 9]] + "-" + 转换密钥格式[arr[offset + 10]] + 转换密钥格式[arr[offset + 11]] + 转换密钥格式[arr[offset + 12]] + 转换密钥格式[arr[offset + 13]] + 转换密钥格式[arr[offset + 14]] + 转换密钥格式[arr[offset + 15]]).toLowerCase();
-    return uuid;
-  }
+async function handleConfigSync(request, env) {
+    try {
+        const data = await request.json();
+        if (data.key !== sysConfig.masterKey) return new Response(JSON.stringify({ success: false }), { status: 401 });
+        if (!env.IOT_DB) return new Response(JSON.stringify({ success: false, msg: "DB Error" }), { status: 400 });
+        const nextConfig = { ...sysConfig, ...data.config };
+        await env.IOT_DB.put("sys_config", JSON.stringify(nextConfig));
+        return new Response(JSON.stringify({ success: true, newRoute: nextConfig.apiRoute }), { status: 200 });
+    } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
+}
 
-  async function 建立传输管道(写入初始数据) {
-    传输数据 = TCP接口.writable.getWriter();
+async function processTelemetryStream() {
+    const [client, webSocket] = Object.values(new WebSocketPair());
+    webSocket.accept();
+    webSocket.binaryType = "arraybuffer";
+    startDataPipe(webSocket);
+    return new Response(null, { status: 101, webSocket: client });
+}
 
-    if (写入初始数据?.byteLength > 0) {
-      await 传输数据.write(写入初始数据);
+async function startDataPipe(webSocket) {
+    let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
+    webSocket.addEventListener("message", (event) => {
+        queue = queue.then(async () => {
+            try {
+                if (isInit) {
+                    isInit = false;
+                    const isModeAlpha = await parseSensorData(event.data);
+                    if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
+                } else if (dataWriter) {
+                    await dataWriter.write(event.data);
+                }
+            } catch (err) { webSocket.close(); }
+        });
+    });
+
+    async function parseSensorData(bufferData) {
+        const view = new Uint8Array(bufferData);
+        let targetAddr = "", targetPort = 0, offset = 0, isModeAlpha = false;
+
+        if (view[0] === 0x00) {
+            isModeAlpha = true;
+            const optLen = view[17];
+            const pPos = 18 + optLen + 1;
+            targetPort = new DataView(bufferData.slice(pPos, pPos + 2)).getUint16(0);
+            const aType = view[pPos + 2];
+            let vPos = pPos + 3, aLen = 0;
+
+            if (aType === 1) { aLen = 4; targetAddr = view.slice(vPos, vPos + aLen).join("."); }
+            else if (aType === 2) { aLen = view[vPos]; vPos++; targetAddr = new TextDecoder().decode(view.slice(vPos, vPos + aLen)); }
+            else if (aType === 3) { aLen = 16; const dv = new DataView(bufferData.slice(vPos, vPos + aLen)); targetAddr = Array.from({ length: 8 }, (_, i) => dv.getUint16(i * 2).toString(16)).join(":"); }
+            offset = vPos + aLen;
+        } else {
+            let ePos = bufferData.byteLength;
+            for (let i = 0; i < bufferData.byteLength; i++) { if (view[i] === 0x0D && view[i + 1] === 0x0A) { ePos = i; break; } }
+            let hPos = ePos + 2; hPos++;
+            let aType = view[hPos]; hPos++; let aLen = 0;
+
+            if (aType === 1) { aLen = 4; targetAddr = view.slice(hPos, hPos + aLen).join("."); }
+            else if (aType === 3) { aLen = view[hPos]; hPos++; targetAddr = new TextDecoder().decode(view.slice(hPos, hPos + aLen)); }
+            else if (aType === 4) { aLen = 16; const dv = new DataView(bufferData.slice(hPos, hPos + aLen)); targetAddr = Array.from({ length: 8 }, (_, i) => dv.getUint16(i * 2).toString(16)).join(":"); }
+
+            hPos += aLen;
+            targetPort = new DataView(bufferData.slice(hPos, hPos + 2)).getUint16(0);
+            offset = hPos + 4;
+        }
+
+        try {
+            remoteSocket = connect({ hostname: targetAddr, port: targetPort });
+            await remoteSocket.opened;
+        } catch {
+            if (sysConfig.backupRelay) {
+                try {
+                    const [altIP, altPortStr] = sysConfig.backupRelay.split(":");
+                    remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
+                    await remoteSocket.opened;
+                } catch { webSocket.close(); return isModeAlpha; }
+            } else {
+                webSocket.close(); return isModeAlpha;
+            }
+        }
+
+        dataWriter = remoteSocket.writable.getWriter();
+        if (offset < bufferData.byteLength) await dataWriter.write(bufferData.slice(offset));
+        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { webSocket.send(chunk); } }));
+
+        return isModeAlpha;
     }
+}
 
-    TCP接口.readable.pipeTo(
-      new WritableStream({
-        write(chunk) {
-          WS接口.send(chunk);
-        },
-      })
-    );
+function generateHardwareId(seed) {
+    const h20 = Array.from(new TextEncoder().encode(seed)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 20).padEnd(20, "0");
+    return `${h20.slice(0, 8)}-0000-4000-8000-${h20.slice(-12)}`;
+}
+
+function getTransportParams(port) {
+    return ["80", "8080", "8880", "2052", "2082", "2086", "2095"].includes(port.toString()) ? "none" : "tls";
+}
+
+function getCleanIps(hostName) {
+    let ips = sysConfig.cleanIps ? sysConfig.cleanIps.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean) : [];
+    if (ips.length === 0) ips = [hostName.endsWith('.pages.dev') ? sysConfig.metricNode : hostName];
+    return ips;
+}
+
+function buildSingleUri(hostName) {
+    let finalIP = getCleanIps(hostName)[0];
+    let sec = getTransportParams(sysConfig.socketPort);
+    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
+    let uriProto = sysConfig.mode === "beta" ? getBeta() : getAlpha();
+    let ext = `encryption=none&security=${sec}&sni=${hostName}&fp=${sysConfig.agent}&type=ws&host=${hostName}&path=${reqPath}`;
+    if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
+    return `${uriProto}://${activeDeviceId}@${finalIP}:${sysConfig.socketPort}?${ext}#${hostName}`;
+}
+
+function buildUriProfile(hostName) {
+    let ips = getCleanIps(hostName);
+    let sec = getTransportParams(sysConfig.socketPort);
+    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
+    let ext = `encryption=none&security=${sec}&sni=${hostName}&fp=${sysConfig.agent}&type=ws&host=${hostName}&path=${reqPath}`;
+    if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
+
+    let lines = [];
+    ips.forEach(ip => {
+        lines.push(`${getAlpha()}://${activeDeviceId}@${ip}:${sysConfig.socketPort}?${ext}#V-Core-[${ip}]`);
+        lines.push(`${getBeta()}://${activeDeviceId}@${ip}:${sysConfig.socketPort}?${ext}#T-Core-[${ip}]`);
+    });
+    return lines.join('\n');
+}
+
+function buildYamlProfile(hostName) {
+    let ips = getCleanIps(hostName);
+    let sec = getTransportParams(sysConfig.socketPort) === "tls";
+    let proxies = [];
+    let proxyNames = [];
+
+    ips.forEach(ip => {
+        let vName = `V-Core-[${ip}]`;
+        proxyNames.push(vName);
+        proxies.push(`- name: ${vName}\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  uuid: ${activeDeviceId}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+
+        let tName = `T-Core-[${ip}]`;
+        proxyNames.push(tName);
+        proxies.push(`- name: ${tName}\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${sysConfig.socketPort}\n  password: ${activeDeviceId}\n  udp: true\n  tls: ${sec}\n  sni: ${hostName}\n  client-fingerprint: ${sysConfig.agent}\n  network: ws\n  ws-opts:\n    path: "/${sysConfig.apiRoute}"\n    headers: { Host: ${hostName} }\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+    });
+
+    return `proxies:\n${proxies.join('\n')}\nproxy-groups:\n- name: Data Group\n  type: select\n  proxies: \n${proxyNames.map(n => `    - ${n}`).join('\n')}\nrules:\n  - MATCH,Data Group\n`;
+}
+
+function getDashboardUI(hasDB) {
+    return `
+  <!DOCTYPE html>
+  <html lang="en" class="light">
+  <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+      <title>Nahan Telemetry</title>
+      <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;900&display=swap" rel="stylesheet">
+      <script src="https://cdn.tailwindcss.com"></script>
+      <script>
+          tailwind.config = { 
+              darkMode: 'class', 
+              theme: { 
+                  extend: { 
+                      fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
+                      colors: { primary: '#6366f1', darkbg: '#0f172a', darkcard: '#1e293b', darkborder: '#334155' } 
+                  } 
+              } 
+          }
+      </script>
+      <style>
+          ::-webkit-scrollbar { width: 6px; height: 6px; }
+          ::-webkit-scrollbar-track { background: transparent; }
+          ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+          .dark ::-webkit-scrollbar-thumb { background: #475569; }
+          .fade-in { animation: fadeIn 0.3s ease-in-out; }
+          @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+          .nav-item.active { background-color: rgba(99, 102, 241, 0.1); color: #6366f1; border-inline-start: 4px solid #6366f1; font-weight: 700; }
+          .dark .nav-item.active { background-color: rgba(99, 102, 241, 0.2); color: #818cf8; border-inline-start: 4px solid #818cf8; }
+          .nav-item { border-inline-start: 4px solid transparent; transition: all 0.2s; }
+          .mobile-nav-item.active { color: #6366f1; }
+          .dark .mobile-nav-item.active { color: #818cf8; }
+      </style>
+  </head>
+  <body class="bg-slate-50 dark:bg-darkbg text-slate-800 dark:text-slate-200 h-[100dvh] flex flex-col md:flex-row overflow-hidden selection:bg-primary selection:text-white transition-colors duration-300">
+  
+      <!-- Global Controls -->
+      <div class="fixed top-4 end-4 md:top-6 md:end-6 flex items-center space-x-2 space-x-reverse z-50">
+          <a href="https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPOSITORY" target="_blank" class="p-2 bg-white/80 dark:bg-darkcard/80 backdrop-blur rounded-full shadow border border-slate-200 dark:border-darkborder text-slate-600 dark:text-slate-400 hover:text-primary transition-all">
+              <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
+          </a>
+          <button onclick="toggleLang()" id="lang-toggle" class="px-3 py-1 bg-white/80 dark:bg-darkcard/80 backdrop-blur rounded-full shadow border border-slate-200 dark:border-darkborder font-bold text-sm">EN</button>
+          <button onclick="toggleTheme()" class="p-2 bg-white/80 dark:bg-darkcard/80 backdrop-blur rounded-full shadow border border-slate-200 dark:border-darkborder text-amber-500 dark:text-indigo-400">
+              <svg class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+              <svg class="w-5 h-5 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+          </button>
+          <button onclick="logout()" id="btn-logout-mob" class="hidden md:hidden p-2 bg-red-50 dark:bg-red-900/30 text-red-500 rounded-full shadow border border-red-100 dark:border-red-900">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+          </button>
+      </div>
+  
+      <!-- LOGIN SCREEN -->
+      <div id="login-box" class="absolute inset-0 flex items-center justify-center p-4 z-40 bg-slate-50 dark:bg-darkbg">
+          <div class="absolute top-1/4 start-1/4 w-64 h-64 bg-primary/20 rounded-full blur-3xl -z-10"></div>
+          <div class="max-w-md w-full bg-white/90 dark:bg-darkcard/90 backdrop-blur-xl p-8 rounded-3xl shadow-2xl border border-white/40 dark:border-slate-700/50">
+              <div class="text-center mb-8">
+                  <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-indigo-50 dark:bg-indigo-900/30 text-primary mb-4">
+                      <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"></path></svg>
+                  </div>
+                  <h2 class="text-3xl font-black text-slate-800 dark:text-white" data-i18n="title">Nahan Gateway</h2>
+              </div>
+              ${!hasDB ? `<div class="mb-6 p-4 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 rounded-xl text-sm border border-red-100 dark:border-red-900/30"><span data-i18n="missing_db">DB namespace missing!</span></div>` : ''}
+              <input type="password" id="pwd" data-i18n="pass_ph" placeholder="Master Key" class="w-full px-5 py-4 rounded-xl border-2 border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-darkbg focus:border-primary outline-none mb-6 text-center tracking-widest">
+              <button onclick="doLogin()" class="w-full bg-primary text-white font-bold py-4 rounded-xl shadow-lg hover:opacity-90" data-i18n="login_btn">Authenticate</button>
+              <p id="err-msg" class="text-red-500 text-sm mt-4 hidden text-center font-bold" data-i18n="err_pass">Invalid Key</p>
+          </div>
+      </div>
+  
+      <!-- DASHBOARD CONTAINER -->
+      <div id="dash-box" class="hidden w-full h-full flex-col md:flex-row relative">
+          
+          <!-- SIDEBAR (Desktop) -->
+          <aside class="hidden md:flex w-64 bg-white dark:bg-darkcard border-e border-slate-200 dark:border-darkborder flex-col z-20 shrink-0">
+              <div class="flex items-center p-6 border-b border-slate-100 dark:border-darkborder/50">
+                  <div class="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/40 text-primary flex items-center justify-center me-3 shrink-0"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg></div>
+                  <h1 class="font-black text-xl" data-i18n="title">Nahan</h1>
+              </div>
+              <nav class="flex-1 p-4 space-y-2 overflow-y-auto">
+                  <button onclick="switchTab('info')" id="tab-info" class="nav-item active flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
+                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+                      <span class="font-semibold" data-i18n="tab_info">Endpoints</span>
+                  </button>
+                  <button onclick="switchTab('network')" id="tab-network" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
+                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                      <span class="font-semibold" data-i18n="tab_status">Metrics</span>
+                  </button>
+                  <button onclick="switchTab('settings')" id="tab-settings" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
+                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path></svg>
+                      <span class="font-semibold" data-i18n="tab_settings">System</span>
+                  </button>
+                  <button onclick="switchTab('advanced')" id="tab-advanced" class="nav-item flex items-center w-full px-4 py-3 rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 group">
+                      <svg class="w-6 h-6 me-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                      <span class="font-semibold" data-i18n="tab_adv">Advanced</span>
+                  </button>
+              </nav>
+              <div class="p-4 border-t border-slate-100 dark:border-darkborder/50">
+                  <button onclick="logout()" class="flex items-center justify-center w-full px-4 py-2 rounded-lg text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 font-semibold transition-colors">
+                      <svg class="w-5 h-5 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                      <span data-i18n="logout">Disconnect</span>
+                  </button>
+              </div>
+          </aside>
+  
+          <!-- MAIN CONTENT AREA -->
+          <main class="flex-1 flex flex-col h-full overflow-hidden">
+              <header class="h-20 md:h-24 shrink-0 flex items-center px-6 md:px-10 z-10 pt-4 md:pt-0">
+                  <h2 id="view-title" class="text-2xl md:text-3xl font-black text-slate-800 dark:text-white mt-2" data-i18n="tab_info">Endpoints</h2>
+              </header>
+  
+              <!-- Scrollable Content -->
+              <div class="flex-1 overflow-y-auto p-4 md:p-10">
+                  <div class="max-w-4xl mx-auto space-y-6 fade-in">
+                      
+                      <!-- INFO VIEW -->
+                      <div id="view-info" class="space-y-6 block">
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-5 md:p-8 shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden">
+                              <div class="absolute top-0 end-0 w-32 h-32 bg-primary/10 rounded-bl-[100px] -z-10"></div>
+                              
+                              <h3 class="text-lg font-bold text-slate-800 dark:text-white mb-6 flex items-center" data-i18n="qr_title">
+                                  <svg class="w-5 h-5 me-2 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+                                  Direct Stream Link
+                              </h3>
+                              
+                              <div class="flex flex-col sm:flex-row gap-6 items-center sm:items-start">
+                                  <div class="bg-white p-2 rounded-2xl shadow-sm border border-slate-200 shrink-0"><img id="qr-code" src="" class="w-36 h-36 md:w-44 md:h-44 object-contain"></div>
+                                  <div class="w-full space-y-4">
+                                      <div class="relative">
+                                          <input type="text" id="link-direct" readonly class="w-full bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-3 rounded-xl text-sm outline-none text-slate-600 dark:text-slate-300 pe-24 font-mono truncate">
+                                          <button onclick="copyData('link-direct')" class="absolute top-1/2 -translate-y-1/2 end-1.5 bg-indigo-100 hover:bg-indigo-200 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-4 py-1.5 rounded-lg text-sm font-bold transition-colors" data-i18n="copy">Copy</button>
+                                      </div>
+                                      <div class="grid grid-cols-1 gap-4 mt-2">
+                                          <div>
+                                              <div class="flex items-center justify-between mb-2">
+                                                  <label class="block text-xs font-bold text-slate-500 uppercase tracking-wider" data-i18n="sync_link">Cloud Sync URL</label>
+                                                  <span class="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-md font-bold" data-i18n="badge_multi">Dual-Core Multiplexed</span>
+                                              </div>
+                                              <div class="relative">
+                                                  <input type="text" id="link-sync" readonly class="w-full bg-slate-50 dark:bg-darkbg border border-slate-200 dark:border-darkborder px-4 py-3 rounded-lg text-sm outline-none font-mono text-slate-600 dark:text-slate-400 truncate pe-12">
+                                                  <button onclick="copyData('link-sync')" class="absolute top-1/2 -translate-y-1/2 end-1 text-primary p-2 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-md"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>
+                                              </div>
+                                          </div>
+                                      </div>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+  
+                      <!-- NETWORK/METRICS VIEW -->
+                      <div id="view-network" class="hidden space-y-6">
+                          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group">
+                                  <svg class="w-8 h-8 text-blue-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_ip">Origin IP</p>
+                                  <p id="net-ip" class="text-xl md:text-2xl font-black font-mono">...</p>
+                              </div>
+                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group">
+                                  <svg class="w-8 h-8 text-emerald-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_dc">Edge Node</p>
+                                  <p id="net-colo" class="text-xl md:text-2xl font-black font-mono">...</p>
+                              </div>
+                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-1">
+                                  <svg class="w-8 h-8 text-purple-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                                  <p class="text-xs uppercase font-bold text-slate-400 mb-1" data-i18n="stat_loc">Data Region</p>
+                                  <p id="net-loc" class="text-lg font-bold truncate">...</p>
+                              </div>
+  
+                              <!-- Diagnostics Segment -->
+                              <div class="bg-white dark:bg-darkcard p-6 rounded-3xl shadow-sm border border-slate-200 dark:border-darkborder relative overflow-hidden group sm:col-span-2 lg:col-span-3">
+                                  <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                                      <div>
+                                          <h3 class="text-sm uppercase font-bold text-slate-400 mb-1" data-i18n="ping_test_title">Latency Diagnostics</h3>
+                                          <p class="text-xs text-slate-500" data-i18n="ping_test_desc">Test response time to your active node target.</p>
+                                      </div>
+                                      <button onclick="runPingTest()" class="px-6 py-2.5 bg-primary/10 hover:bg-primary/20 text-primary font-bold rounded-xl transition-colors text-sm">
+                                          ⚡ Run Diagnostics
+                                      </button>
+                                  </div>
+                                  <div id="ping-results" class="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-4 hidden">
+                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
+                                          <p class="text-[10px] uppercase font-bold text-slate-400">Target Node</p>
+                                          <p id="ping-target" class="text-sm font-bold font-mono truncate">...</p>
+                                      </div>
+                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
+                                          <p class="text-[10px] uppercase font-bold text-slate-400">Response</p>
+                                          <p id="ping-time" class="text-sm font-bold font-mono text-emerald-500">...</p>
+                                      </div>
+                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
+                                          <p class="text-[10px] uppercase font-bold text-slate-400">Status</p>
+                                          <p id="ping-status" class="text-sm font-bold">...</p>
+                                      </div>
+                                      <div class="bg-slate-50 dark:bg-darkbg p-3 rounded-xl border border-slate-100 dark:border-darkborder/50">
+                                          <p class="text-[10px] uppercase font-bold text-slate-400">Local Port</p>
+                                          <p id="ping-port" class="text-sm font-bold font-mono">...</p>
+                                      </div>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+  
+                      <!-- SETTINGS VIEW -->
+                      <div id="view-settings" class="hidden">
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
+                              <div class="space-y-1">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_proto">Primary Display Mode</label>
+                                  <select id="cfg-proto" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
+                                      <option value="alpha">Alpha Mode (V-Core)</option>
+                                      <option value="beta">Beta Mode (T-Core)</option>
+                                  </select>
+                              </div>
+                              <div class="space-y-1">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_port">Data Port</label>
+                                  <select id="cfg-port" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none appearance-none">
+                                      <option value="443">443 (Secure TLS)</option>
+                                      <option value="8443">8443 (Alt TLS)</option>
+                                      <option value="80">80 (Standard)</option>
+                                      <option value="8080">8080 (Alt Standard)</option>
+                                  </select>
+                              </div>
+                              <div class="space-y-1 md:col-span-2">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_id">Device UUID (Empty=Auto)</label>
+                                  <input type="text" id="cfg-uuid" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none font-mono text-sm">
+                              </div>
+                              <div class="space-y-1">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_path">API Route (Hidden Path)</label>
+                                  <input type="text" id="cfg-path" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                              </div>
+                              <div class="space-y-1">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_pass">Master Key</label>
+                                  <input type="text" id="cfg-pass" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
+                              </div>
+  
+                              <!-- Import/Export Config Area -->
+                              <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
+                                  <h3 class="text-sm uppercase font-bold text-slate-400 tracking-wider" data-i18n="backup_restore_title">Backup & Restore</h3>
+                                  <div class="flex flex-col sm:flex-row gap-4">
+                                      <button onclick="exportConfig()" class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm">
+                                          📥 Export Configuration (JSON)
+                                      </button>
+                                      <label class="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-bold rounded-xl transition-colors text-sm text-center cursor-pointer">
+                                          📤 Import Configuration (JSON)
+                                          <input type="file" id="import-file" class="hidden" accept=".json" onchange="importConfig(event)">
+                                      </label>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+  
+                      <!-- ADVANCED VIEW -->
+                      <div id="view-advanced" class="hidden space-y-6">
+                          <!-- Multi Clean IP Section -->
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder">
+                              <div class="flex items-center justify-between mb-4">
+                                  <h3 class="text-sm uppercase font-bold text-slate-500 tracking-wider" data-i18n="lbl_clean_ips">Clean IPs (Multi-Generator)</h3>
+                                  <span class="text-xs bg-indigo-100 dark:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 px-2 py-1 rounded-md font-bold" id="ip-count-badge">1 Config Set</span>
+                              </div>
+                              <textarea id="cfg-ips" rows="3" data-i18n="ph_clean_ips" placeholder="" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary focus:ring-1 outline-none font-mono text-sm resize-none"></textarea>
+                              <p class="text-xs text-slate-400 mt-2" data-i18n="desc_clean_ips">Put one IP per line. The Sync URL will multiply configs for all IPs.</p>
+                          </div>
+  
+                          <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder grid grid-cols-1 md:grid-cols-2 gap-5">
+                              <div class="space-y-1 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fp">TLS Signature</label>
+                                  <select id="cfg-fp" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none appearance-none">
+                                      <option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option>
+                                  </select>
+                              </div>
+                              <div class="space-y-1 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_dns">Resolver IP</label>
+                                  <input type="text" id="cfg-dns" placeholder="1.1.1.1" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                              </div>
+                              <div class="space-y-1 md:col-span-2 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_fake">Maintenance Hosts (Camouflage)</label>
+                                  <input type="text" id="cfg-fake" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                              </div>
+                          </div>
+  
+                          <div class="flex flex-col sm:flex-row gap-4 p-4 bg-white dark:bg-darkcard rounded-3xl border border-slate-200 dark:border-darkborder">
+                              <!-- TCP Fast Open Toggle -->
+                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
+                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_tfo">TCP Fast Open</span>
+                                  <div class="relative inline-flex items-center cursor-pointer">
+                                      <input type="checkbox" id="cfg-tfo" class="sr-only peer">
+                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                  </div>
+                              </label>
+                              <!-- Secure Hello (ECH) Toggle -->
+                              <label class="flex-1 flex items-center justify-between sm:justify-start cursor-pointer group bg-slate-50 dark:bg-slate-800/50 p-3 rounded-2xl">
+                                  <span class="text-sm font-bold text-slate-700 dark:text-slate-300 sm:me-4" data-i18n="lbl_ech">Secure Hello (ECH)</span>
+                                  <div class="relative inline-flex items-center cursor-pointer">
+                                      <input type="checkbox" id="cfg-ech" class="sr-only peer">
+                                      <div class="w-11 h-6 bg-slate-300 dark:bg-slate-600 rounded-full peer peer-checked:after:translate-x-5 rtl:peer-checked:after:-translate-x-5 peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-500 peer-checked:bg-primary"></div>
+                                  </div>
+                              </label>
+                          </div>
+                      </div>
+                  </div>
+              </div>
+  
+              <!-- Save Bar (Docked to bottom of main content) -->
+              <div class="shrink-0 bg-white dark:bg-darkcard border-t border-slate-200 dark:border-darkborder p-4 flex justify-between md:justify-end items-center z-20">
+                  <span id="save-status" class="text-sm font-bold text-slate-500 md:me-4"></span>
+                  <button onclick="doSave()" class="px-8 py-3 bg-primary text-white font-bold rounded-xl shadow-lg hover:opacity-90 transition-opacity" data-i18n="save_btn">Save Config</button>
+              </div>
+          </main>
+  
+          <!-- BOTTOM NAV (Mobile) -->
+          <nav class="md:hidden w-full h-16 bg-white dark:bg-darkcard border-t border-slate-200 dark:border-darkborder flex justify-around items-center z-30 shrink-0 pb-safe">
+              <button onclick="switchTab('info')" id="mob-tab-info" class="mobile-nav-item active flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+                  <span class="text-[10px] font-bold" data-i18n="tab_info">Endpoints</span>
+              </button>
+              <button onclick="switchTab('network')" id="mob-tab-network" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
+                  <span class="text-[10px] font-bold" data-i18n="tab_status">Metrics</span>
+              </button>
+              <button onclick="switchTab('settings')" id="mob-tab-settings" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path></svg>
+                  <span class="text-[10px] font-bold" data-i18n="tab_settings">System</span>
+              </button>
+              <button onclick="switchTab('advanced')" id="mob-tab-advanced" class="mobile-nav-item flex flex-col items-center justify-center w-full h-full text-slate-400">
+                  <svg class="w-6 h-6 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                  <span class="text-[10px] font-bold" data-i18n="tab_adv">Network</span>
+              </button>
+          </nav>
+      </div>
+  
+      <!-- Toast Notification -->
+      <div id="copy-toast" class="fixed top-20 md:top-10 left-1/2 -translate-x-1/2 bg-slate-800 dark:bg-white text-white dark:text-slate-900 px-6 py-3 rounded-full shadow-2xl font-bold text-sm z-50 transition-all transform -translate-y-20 opacity-0 pointer-events-none">
+          <span data-i18n="copied">Copied!</span>
+      </div>
+  
+      <script>
+          const i18n = {
+              en: {
+                  title: "Nahan Gateway", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
+                  logout: "Disconnect", tab_info: "Endpoints", tab_status: "Metrics", tab_settings: "System", tab_adv: "Advanced",
+                  qr_title: "Direct Stream Link", badge_multi: "Dual-Core Multiplexed", copy: "Copy", copied: "Copied to clipboard!", sync_link: "Cloud Sync URL", active_id: "Hardware ID",
+                  stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
+                  lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
+                  lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
+                  lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
+                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",
+                  save_btn: "Update Config", msg_saving: "Syncing...", msg_saved: "Success! Reloading...", msg_err: "Sync Error",
+                  backup_restore_title: "Backup & Restore", ping_test_title: "Latency Diagnostics", ping_test_desc: "Test response time to your active node target."
+              },
+              fa: {
+                  title: "دروازه نهان", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای IOT_DB یافت نشد! تنظیمات ذخیره نمی‌شوند.",
+                  logout: "خروج", tab_info: "نقاط اتصال", tab_status: "وضعیت شبکه", tab_settings: "تنظیمات پایه", tab_adv: "پیشرفته",
+                  qr_title: "لینک اتصال مستقیم", badge_multi: "ترکیب دوگانه V+T", copy: "کپی", copied: "در حافظه کپی شد!", sync_link: "لینک ساب (Cloud Sync)", active_id: "شناسه سخت‌افزار",
+                  stat_ip: "آی‌پی مبدا", stat_dc: "گره لبه", stat_loc: "منطقه داده",
+                  lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
+                  lbl_path: "مسیر مخفی API", lbl_pass: "کلید اصلی", lbl_fp: "امضای TLS", lbl_dns: "آی‌پی تحلیلگر",
+                  lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
+                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_tfo: "اتصال سریع (TFO)", lbl_ech: "سلام امن (ECH)",
+                  save_btn: "ذخیره تنظیمات", msg_saving: "در حال ثبت...", msg_saved: "موفق! در حال بارگذاری...", msg_err: "خطای ارتباط",
+                  backup_restore_title: "پشتیبان‌گیری و بازیابی", ping_test_title: "عیب‌یابی تاخیر شبکه", ping_test_desc: "تاخیر پاسخ‌دهی را به آی‌پی تمیز فعال اندازه بگیرید."
+              }
+          };
+  
+          let lang = localStorage.getItem('lang') || 'fa';
+          let sessionKey = "", baseRoute = window.location.pathname.split('/dash')[0];
+          let hostName = window.location.hostname, localUUID = "";
+  
+          function applyLang() {
+              document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
+              document.getElementById('lang-toggle').innerText = lang === 'fa' ? 'EN' : 'فا';
+              document.querySelectorAll('[data-i18n]').forEach(el => {
+                  const key = el.getAttribute('data-i18n');
+                  if(el.placeholder !== undefined && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) el.placeholder = i18n[lang][key];
+                  else el.innerText = i18n[lang][key];
+              });
+          }
+          function toggleLang() { lang = lang === 'fa' ? 'en' : 'fa'; localStorage.setItem('lang', lang); applyLang(); updateTitle(); updateUI(); }
+          applyLang();
+  
+          if (localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+              document.documentElement.classList.add('dark');
+          } else {
+              document.documentElement.classList.remove('dark');
+          }
+  
+          function toggleTheme() {
+              document.documentElement.classList.toggle('dark');
+              localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
+          }
+  
+          function updateTitle() {
+              const activeTab = document.querySelector('.nav-item.active span');
+              if(activeTab) document.getElementById('view-title').innerText = activeTab.innerText;
+          }
+  
+          function switchTab(tab) {
+              ['info','network','settings','advanced'].forEach(t => {
+                  const view = document.getElementById('view-'+t);
+                  const deskBtn = document.getElementById('tab-'+t);
+                  const mobBtn = document.getElementById('mob-tab-'+t);
+                  if (tab === t) {
+                      view.classList.remove('hidden'); view.classList.add('block', 'fade-in');
+                      deskBtn.classList.add('active'); mobBtn.classList.add('active');
+                  } else {
+                      view.classList.add('hidden'); view.classList.remove('block', 'fade-in');
+                      deskBtn.classList.remove('active'); mobBtn.classList.remove('active');
+                  }
+              });
+              updateTitle();
+          }
+  
+          function copyData(id) {
+              const input = document.getElementById(id); input.select(); navigator.clipboard.writeText(input.value);
+              const toast = document.getElementById('copy-toast');
+              toast.style.transform = 'translate(-50%, 0)'; toast.style.opacity = '1';
+              setTimeout(() => { toast.style.transform = 'translate(-50%, -5rem)'; toast.style.opacity = '0'; }, 2000);
+          }
+  
+          function updateUI() {
+              try {
+                  let port = document.getElementById('cfg-port').value;
+                  let proto = document.getElementById('cfg-proto').value === 'beta' ? String.fromCharCode(116, 114, 111, 106, 97, 110) : String.fromCharCode(118, 108, 101, 115, 115);
+                  let rawIps = document.getElementById('cfg-ips').value || "";
+                  
+                  let ipsList = rawIps.replace(/,/g, '\\n').replace(/;/g, '\\n').split('\\n').map(s=>s.trim()).filter(Boolean);
+                  let finalIP = ipsList.length > 0 ? ipsList[0] : (hostName.endsWith('.pages.dev') ? 'time.is' : hostName);
+                  
+                  let fp = document.getElementById('cfg-fp').value;
+                  let path = encodeURI("/" + document.getElementById('cfg-path').value);
+                  let sec = ["80","8080"].includes(port) ? "none" : "tls";
+                  
+                  let rawLink = proto + "://" + localUUID + "@" + finalIP + ":" + port + "?encryption=none&security=" + sec + "&sni=" + hostName + "&fp=" + fp + "&type=ws&host=" + hostName + "&path=" + path;
+                  if (document.getElementById('cfg-ech').checked) rawLink += "&pbk=enabled";
+                  rawLink += "#" + hostName;
+  
+                  document.getElementById('link-direct').value = rawLink;
+                  document.getElementById('qr-code').src = "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(rawLink);
+  
+                  let totalIps = ipsList.length === 0 ? 1 : ipsList.length;
+                  let tCfg = totalIps * 2; 
+                  document.getElementById('ip-count-badge').innerText = lang === 'fa' ? (tCfg + ' کانفیگ تولید شد') : (tCfg + ' Configs Active');
+              } catch(e) { console.error(e); }
+          }
+  
+          function logout() {
+              localStorage.removeItem('nahan_session');
+              window.location.reload();
+          }
+  
+          // Export active page inputs configuration
+          function exportConfig() {
+              const el = id => document.getElementById(id);
+              const payload = {
+                  mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
+                  apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
+                  resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value,
+                  enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked
+              };
+              const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
+              const dlAnchor = document.createElement('a');
+              dlAnchor.setAttribute("href", dataStr);
+              dlAnchor.setAttribute("download", "nahan-gateway-config.json");
+              document.body.appendChild(dlAnchor);
+              dlAnchor.click();
+              dlAnchor.remove();
+          }
+  
+          // Import backup json to overwrite config inputs 
+          function importConfig(event) {
+              const file = event.target.files[0];
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = function(e) {
+                  try {
+                      const conf = JSON.parse(e.target.result);
+                      const mapId = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined) el.value = val; };
+                      mapId('cfg-proto', conf.mode);
+                      mapId('cfg-port', conf.socketPort);
+                      mapId('cfg-uuid', conf.deviceId);
+                      mapId('cfg-path', conf.apiRoute);
+                      mapId('cfg-pass', conf.masterKey);
+                      mapId('cfg-fp', conf.agent);
+                      mapId('cfg-dns', conf.resolveIp);
+                      mapId('cfg-ips', conf.cleanIps);
+                      mapId('cfg-fake', conf.maintenanceHost);
+                      
+                      if (conf.enableOpt1 !== undefined) document.getElementById('cfg-tfo').checked = conf.enableOpt1;
+                      if (conf.enableOpt2 !== undefined) document.getElementById('cfg-ech').checked = conf.enableOpt2;
+                      
+                      updateUI();
+                      alert(lang === 'fa' ? 'پیکربندی با موفقیت وارد شد! روی ذخیره کلیک کنید.' : 'Configuration parsed! Click save to write changes.');
+                  } catch(err) {
+                      alert(lang === 'fa' ? 'فایل نامعتبر است!' : 'Invalid configuration file!');
+                  }
+              };
+              reader.readAsText(file);
+          }
+  
+          // Browser-level latency check diagnostics
+          async function runPingTest() {
+              const rawIps = document.getElementById('cfg-ips').value || "";
+              let ipsList = rawIps.replace(/,/g, '\\n').replace(/;/g, '\\n').split('\\n').map(s=>s.trim()).filter(Boolean);
+              let targetIP = ipsList.length > 0 ? ipsList[0] : (hostName.endsWith('.pages.dev') ? 'time.is' : hostName);
+              
+              const resultsDiv = document.getElementById('ping-results');
+              resultsDiv.classList.remove('hidden');
+              
+              document.getElementById('ping-target').textContent = targetIP;
+              document.getElementById('ping-time').textContent = 'Testing...';
+              document.getElementById('ping-status').textContent = 'Dialing...';
+              document.getElementById('ping-port').textContent = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+              
+              const startTime = performance.now();
+              try {
+                  await fetch('https://' + targetIP + '/favicon.ico?cb=' + startTime, { mode: 'no-cors', cache: 'no-store' });
+                  const duration = Math.round(performance.now() - startTime);
+                  document.getElementById('ping-time').textContent = duration + ' ms';
+                  document.getElementById('ping-status').className = "text-sm font-bold text-emerald-500";
+                  document.getElementById('ping-status').textContent = "Success";
+              } catch (err) {
+                  const duration = Math.round(performance.now() - startTime);
+                  if (duration < 1500) {
+                      document.getElementById('ping-time').textContent = duration + ' ms';
+                      document.getElementById('ping-status').className = "text-sm font-bold text-amber-500";
+                      document.getElementById('ping-status').textContent = "Indirect-OK";
+                  } else {
+                      document.getElementById('ping-time').textContent = 'Timeout';
+                      document.getElementById('ping-status').className = "text-sm font-bold text-red-500";
+                      document.getElementById('ping-status').textContent = "Unreachable";
+                  }
+              }
+          }
+  
+          async function doLogin(silent = false) {
+              const btn = document.querySelector('button[onclick="doLogin()"]');
+              const origText = btn.innerText; 
+              if(!silent) btn.innerText = "...";
+              try {
+                  const pass = document.getElementById('pwd').value;
+                  const res = await fetch(baseRoute + '/api/auth', { method: 'POST', body: JSON.stringify({ key: pass }) });
+                  const data = await res.json();
+                  if (data.success) {
+                      sessionKey = pass; localUUID = data.deviceId;
+                      localStorage.setItem('nahan_session', JSON.stringify({ key: pass, expiry: Date.now() + 30 * 60 * 1000 }));
+                      
+                      document.getElementById('login-box').classList.add('hidden');
+                      document.getElementById('dash-box').classList.remove('hidden');
+                      document.getElementById('dash-box').classList.add('flex');
+                      document.getElementById('btn-logout-mob').classList.remove('hidden');
+                      
+                      document.getElementById('net-ip').textContent = data.network.ip;
+                      document.getElementById('net-colo').textContent = data.network.colo;
+                      document.getElementById('net-loc').textContent = data.network.loc;
+                      
+                      const conf = data.config;
+                      document.getElementById('cfg-proto').value = conf.mode || 'alpha';
+                      document.getElementById('cfg-port').value = conf.socketPort || '443';
+                      document.getElementById('cfg-uuid').value = conf.deviceId || '';
+                      document.getElementById('cfg-path').value = conf.apiRoute || '';
+                      document.getElementById('cfg-pass').value = conf.masterKey || '';
+                      document.getElementById('cfg-fp').value = conf.agent || 'chrome';
+                      document.getElementById('cfg-dns').value = conf.resolveIp || '';
+                      document.getElementById('cfg-ips').value = conf.cleanIps || '';
+                      document.getElementById('cfg-fake').value = conf.maintenanceHost || '';
+                      document.getElementById('cfg-tfo').checked = conf.enableOpt1 || false;
+                      document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
+  
+                      ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path'].forEach(id => {
+                          const el = document.getElementById(id);
+                          if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
+                      });
+                      ['cfg-ech','cfg-tfo'].forEach(id => {
+                          const el = document.getElementById(id);
+                          if(el) el.addEventListener('change', updateUI);
+                      });
+                      
+                      document.getElementById('link-sync').value = data.links.sync;
+                      
+                      updateUI();
+                  } else { 
+                      if(!silent) { document.getElementById('err-msg').classList.remove('hidden'); btn.innerText = origText; }
+                      else { localStorage.removeItem('nahan_session'); }
+                  }
+              } catch (err) { if(!silent) btn.innerText = origText; }
+          }
+  
+          async function doSave() {
+              const el = id => document.getElementById(id);
+              const payload = {
+                  key: sessionKey,
+                  config: {
+                      mode: el('cfg-proto').value, socketPort: el('cfg-port').value, deviceId: el('cfg-uuid').value,
+                      apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
+                      resolveIp: el('cfg-dns').value, cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value,
+                      enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked
+                  }
+              };
+              const stat = el('save-status'); stat.textContent = i18n[lang].msg_saving; stat.className = "text-sm font-bold text-primary animate-pulse md:me-4";
+              try {
+                  const res = await fetch(baseRoute + '/api/sync', { method: 'POST', body: JSON.stringify(payload) });
+                  const data = await res.json();
+                  if (data.success) {
+                      stat.textContent = i18n[lang].msg_saved; stat.className = "text-sm font-bold text-emerald-500 md:me-4";
+                      setTimeout(() => window.location.href = '/' + data.newRoute + '/dash', 1000);
+                  } else { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
+              } catch(e) { stat.textContent = i18n[lang].msg_err; stat.className = "text-sm font-bold text-red-500 md:me-4"; }
+          }
+  
+          document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
+  
+          document.addEventListener('DOMContentLoaded', () => {
+              const cached = localStorage.getItem('nahan_session');
+              if(cached) {
+                  try {
+                      const session = JSON.parse(cached);
+                      if (Date.now() < session.expiry) {
+                          document.getElementById('pwd').value = session.key;
+                          doLogin(true);
+                      } else { localStorage.removeItem('nahan_session'); }
+                  } catch(e) { localStorage.removeItem('nahan_session'); }
+              }
+          });
+      </script>
+  </body>
+  </html>
+    `;
   }
-}
-
-// UUID生成函数
-function 生成UUID() {
-  const 二十位 = Array.from(new TextEncoder().encode(订阅路径))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("")
-    .slice(0, 20)
-    .padEnd(20, "0");
-
-  const 前八位 = 二十位.slice(0, 8);
-  const 后十二位 = 二十位.slice(-12);
-
-  return `${前八位}-0000-4000-8000-${后十二位}`;
-}
-
-// 订阅页面
-async function 提示界面() {
-  const 提示界面 = `
-<title>订阅-${订阅路径}</title>
-<style>
-  body {
-    font-size: 25px;
-    text-align: center;
-    margin: 0;
-    padding: 0;
-    height: 100vh;
-    width: 100vw;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-sizing: border-box;
-    overflow: hidden;
-  }
-</style>
-<strong>请把链接导入 ${科拉什} 或 ${威图锐}</strong>
-`;
-
-  return new Response(提示界面, {
-    status: 200,
-    headers: { "Content-Type": "text/html;charset=utf-8" },
-  });
-}
-
-function 威图锐配置文件(hostName) {
-  let 最终地址 = hostName.endsWith('.pages.dev') ? 默认优选 : hostName;
-
-  const 配置内容 = `${维列斯}://${验证UUID}@${最终地址}:443?encryption=none&security=tls&sni=${hostName}&fp=chrome&type=ws&host=${hostName}#${最终地址}`;
-
-  return new Response(配置内容);
-}
-
-function 科拉什配置文件(hostName) {
-  let 最终地址 = hostName.endsWith('.pages.dev') ? 默认优选 : hostName;
-
-  const 配置内容 = `
-proxies:
-- name: ${最终地址}
-  type: ${维列斯}
-  server: ${最终地址}
-  port: 443
-  uuid: ${验证UUID}
-  udp: true
-  tls: true
-  sni: ${hostName}
-  network: ws
-  ws-opts:
-    headers:
-      Host: ${hostName}
-      User-Agent: Chrome
-
-proxy-groups:
-- name: 节点列表
-  type: select
-  proxies:
-    - ${最终地址}
-
-rules:
-  - GEOSITE,cn,DIRECT
-  - GEOIP,CN,DIRECT,no-resolve
-  - MATCH,节点列表
-`;
-
-  return new Response(配置内容);
-}
